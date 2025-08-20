@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # organize_photos.py — v4.4 (Fix sintassi + duplicati/quarantena + EXIF batch)
 # - Prompt interattivi (nessun flag)
-# - Scansione DUPLICATI con report, e risoluzione: QUARANTENA o ELIMINA copie
+# - Scansione DUPLICATI con report (anche tra due cartelle), e risoluzione: QUARANTENA o ELIMINA copie
 # - Organizzazione in ANNO/MESE usando data EXIF/QuickTime (batch) o mtime in fallback
 # - Prescan rapido con os.scandir e selezione batch senza scandire tutto
 # - Sidecar O(1) per nome
@@ -242,6 +242,54 @@ def find_duplicate_groups(base: Path, recursive: bool):
     return dup_groups, total_files, total_bytes
 
 
+def find_duplicate_groups_between(dir1: Path, dir2: Path, recursive: bool):
+    size_map: Dict[int, List[Path]] = defaultdict(list)
+    total_files = 0
+    total_bytes = 0
+    for base in (dir1, dir2):
+        for p in walk_files(base, recursive):
+            try:
+                st = p.stat()
+            except Exception:
+                continue
+            size_map[st.st_size].append(p)
+            total_files += 1
+            total_bytes += st.st_size
+            if total_files % 1000 == 0:
+                print(f"  … indicizzati {total_files} file")
+
+    partial_groups: Dict[Tuple[int, str], List[Path]] = defaultdict(list)
+    for size, group in size_map.items():
+        if len(group) < 2:
+            continue
+        for p in group:
+            try:
+                ph = file_sha1_head(p, PARTIAL_HASH_BYTES)
+            except Exception:
+                continue
+            partial_groups[(size, ph)].append(p)
+
+    full_groups: Dict[str, List[Path]] = defaultdict(list)
+    for (size, ph), group in partial_groups.items():
+        if len(group) < 2:
+            continue
+        for p in group:
+            try:
+                h = file_sha1(p)
+            except Exception:
+                continue
+            full_groups[h].append(p)
+
+    dup_groups = {h: lst for h, lst in full_groups.items() if len(lst) > 1}
+    filtered: Dict[str, List[Path]] = {}
+    for h, paths in dup_groups.items():
+        in1 = any(p.is_relative_to(dir1) for p in paths)
+        in2 = any(p.is_relative_to(dir2) for p in paths)
+        if in1 and in2:
+            filtered[h] = paths
+    return filtered, total_files, total_bytes
+
+
 def scan_duplicates(base: Path, recursive: bool):
     print(f"Inizio scansione duplicati in: {base}  (ricorsivo: {'Sì' if recursive else 'No'})")
     dup_groups, total_files, total_bytes = find_duplicate_groups(base, recursive)
@@ -267,6 +315,49 @@ def scan_duplicates(base: Path, recursive: bool):
 
     print(f"Scansione completata. Gruppi duplicati: {groups_count}.")
     print(f"Report scritto in: {base / DUP_SCAN_REPORT}")
+    return dup_groups
+
+
+def scan_duplicates_between(dir1: Path, dir2: Path, recursive: bool):
+    print(
+        f"Inizio scansione duplicati tra: {dir1} e {dir2}  (ricorsivo: {'Sì' if recursive else 'No'})"
+    )
+    dup_groups, total_files, total_bytes = find_duplicate_groups_between(dir1, dir2, recursive)
+    groups_count = len(dup_groups)
+    potential_savings = 0
+
+    with (dir1 / DUP_SCAN_REPORT).open("w", encoding="utf-8") as f:
+        f.write(
+            f"Report duplicati tra due cartelle — generato: {datetime.now().isoformat()}\n"
+        )
+        f.write(f"Cartella A: {dir1}\nCartella B: {dir2}\n")
+        f.write(f"Ricorsivo: {'Sì' if recursive else 'No'}\n")
+        f.write(
+            f"File indicizzati: {total_files}  (totale dati: {human_size(total_bytes)})\n\n"
+        )
+        for i, (h, paths) in enumerate(
+            sorted(dup_groups.items(), key=lambda x: -len(x[1])), start=1
+        ):
+            try:
+                sz = paths[0].stat().st_size
+            except Exception:
+                sz = 0
+            save = sz * (len(paths) - 1)
+            potential_savings += save
+            f.write(
+                f"[{i}] SHA1={h}  pezzi={len(paths)}  size={human_size(sz)}  risparmio_potenziale={human_size(save)}\n"
+            )
+            for p in paths:
+                f.write(f"    - {p}\n")
+            f.write("\n")
+        f.write(
+            f"=== RIEPILOGO ===\nGruppi duplicati: {groups_count}\nPotenziale spazio recuperabile: {human_size(potential_savings)}\n"
+        )
+
+    print(
+        f"Scansione completata. Gruppi duplicati tra cartelle: {groups_count}."
+    )
+    print(f"Report scritto in: {dir1 / DUP_SCAN_REPORT}")
     return dup_groups
 
 
@@ -349,19 +440,40 @@ def main():
     exiftool = detect_exiftool(base)
 
     # Prompt: scansione / risoluzione duplicati
-    dup = input("Vuoi eseguire una SCANSIONE DUPLICATI senza spostare nulla? [s/N]: ").strip().lower()
+    dup = input(
+        "Vuoi eseguire una SCANSIONE DUPLICATI senza spostare nulla? [s/N]: "
+    ).strip().lower()
     if dup == "s":
+        dir1_in = input(
+            "Prima cartella sorgente [Invio = cartella script]: "
+        ).strip()
+        dir2_in = input(
+            "Seconda cartella per confronto (Invio = nessuna): "
+        ).strip()
         rec = input("Includere anche le SOTTOCARTELLE (ricorsivo)? [S/n]: ").strip().lower()
         recursive = (rec != "n")
-        dup_groups = scan_duplicates(base, recursive)
+        dir1 = Path(dir1_in).resolve() if dir1_in else base
+        if dir2_in:
+            dir2 = Path(dir2_in).resolve()
+            scan_duplicates_between(dir1, dir2, recursive)
+            print("\nFINE scansione duplicati tra cartelle. Esco.")
+            return
+        dup_groups = scan_duplicates(dir1, recursive)
         if dup_groups:
-            fix = input("Vuoi RISOLVERE i duplicati adesso lasciandone uno solo? [s/N]: ").strip().lower()
+            fix = input(
+                "Vuoi RISOLVERE i duplicati adesso lasciandone uno solo? [s/N]: "
+            ).strip().lower()
             if fix == "s":
-                mode = input("Come procedo? [1 = sposta in QUARANTENA (consigliato), 2 = ELIMINA definitivamente]: ").strip()
+                mode = input(
+                    "Come procedo? [1 = sposta in QUARANTENA (consigliato), 2 = ELIMINA definitivamente]: "
+                ).strip()
                 mode = "delete" if mode == "2" else "quarantine"
-                print("ATTENZIONE: l'operazione è potenzialmente distruttiva. Continua? [s/N]: ", end="")
+                print(
+                    "ATTENZIONE: l'operazione è potenzialmente distruttiva. Continua? [s/N]: ",
+                    end="",
+                )
                 if input().strip().lower() == "s":
-                    consolidate_duplicates(base, dup_groups, mode=mode)
+                    consolidate_duplicates(dir1, dup_groups, mode=mode)
                 else:
                     print("Annullato su richiesta utente.")
         else:
