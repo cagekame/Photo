@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-# organize_photos.py — v4.4 (Fix sintassi + duplicati/quarantena + EXIF batch)
-# - Prompt interattivi (nessun flag)
-# - Scansione DUPLICATI con report (anche tra due cartelle), e risoluzione: QUARANTENA o ELIMINA copie
-# - Organizzazione in ANNO/MESE usando data EXIF/QuickTime (batch) o mtime in fallback
-# - Prescan rapido con os.scandir e selezione batch senza scandire tutto
-# - Sidecar O(1) per nome
-# - Niente rinomina, niente sovrascrittura; duplicati via SHA1
-# - Interruzione sicura con CTRL+C + contatore avanzamento
+# organize_photos.py — v4.9-exifcfg
+# - exiftool: formato date forzato (-d "%Y:%m:%d %H:%M:%S%z")
+# - Ricerca percorso + prompt + cache in exiftool_path.txt
+# - Fix Windows: se WinError 5 (Accesso negato) -> fallback via cmd.exe (shell=True)
+# - Log tag scelto; fallback a mtime se nessuna data disponibile
+# - Duplicati (scan/quarantena/elimina) e organizzazione ANNO/MESE
 
 import os
 import sys
@@ -18,27 +16,41 @@ import hashlib
 import shutil
 from heapq import nsmallest
 from collections import defaultdict
-from typing import Dict, List, Tuple, Iterable
+from typing import Dict, List, Tuple, Iterable, Any
 
+# ----------------------------
+# Config
+# ----------------------------
 PHOTO_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".dng", ".nef", ".cr2", ".cr3", ".arw", ".rw2", ".orf"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mts", ".m2ts", ".3gp"}
 ALL_EXT = PHOTO_EXT | VIDEO_EXT
-
 SIDECAR_EXT = {".aae", ".xmp", ".thm", ".lrv"}
 
 DATE_KEYS = [
-    "DateTimeOriginal", "CreateDate",           # foto
-    "MediaCreateDate", "TrackCreateDate",       # video (QuickTime)
+    "SubSecDateTimeOriginal", "DateTimeOriginal",
+    "SubSecCreateDate", "CreateDate",
+    "XMP:DateCreated", "Photoshop:DateCreated", "IPTC:DateCreated",
+    "MediaCreateDate", "TrackCreateDate", "CreationDate",
     "ModifyDate",
+    "FileCreateDate", "FileModifyDate",
 ]
 
 REPORT_FILE = "duplicati_report.txt"
 DUP_SCAN_REPORT = "duplicati_scan.txt"
 DUP_ACTION_LOG = "duplicati_action.txt"
-BATCH_EXIF_SIZE = 25          # evita comandi troppo lunghi su Windows
+CONFIG_FILE = "exiftool_path.txt"
+
+BATCH_EXIF_SIZE = 25
 PARTIAL_HASH_BYTES = 4 * 1024 * 1024  # 4MB per pre-hash
 
+# Opzioni
+WARN_ON_MTIME = True
+LOG_PICKED_DATE = True
+NORMALIZE_TO_LOCAL = True
 
+# ----------------------------
+# Gestione exiftool (rilevamento + prompt + cache su file)
+# ----------------------------
 def detect_exiftool(base_dir: Path) -> str | None:
     exe_name = "exiftool.exe" if os.name == "nt" else "exiftool"
     sub = base_dir / "exiftool" / exe_name
@@ -53,14 +65,38 @@ def detect_exiftool(base_dir: Path) -> str | None:
             return str(cand)
     return None
 
+def get_exiftool_path(base: Path) -> str | None:
+    found = detect_exiftool(base)
+    if found:
+        return found
+    cfg = base / CONFIG_FILE
+    if cfg.exists():
+        try:
+            path = cfg.read_text(encoding="utf-8").strip()
+            if Path(path).exists():
+                return path
+        except Exception:
+            pass
+    print("❌ exiftool non trovato automaticamente.")
+    path = input("Inserisci il percorso completo di exiftool.exe: ").strip('" ')
+    if Path(path).exists():
+        try:
+            cfg.write_text(path, encoding="utf-8")
+            print(f"✔ Percorso salvato in {CONFIG_FILE}")
+        except Exception:
+            print("⚠ Non sono riuscito a salvare il percorso, lo userò solo per questa sessione.")
+        return path
+    return None
 
+# ----------------------------
+# Utilità
+# ----------------------------
 def file_sha1(p: Path, bufsize: int = 1024 * 1024) -> str:
     h = hashlib.sha1()
     with p.open("rb") as f:
         for chunk in iter(lambda: f.read(bufsize), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 def file_sha1_head(p: Path, max_bytes: int = PARTIAL_HASH_BYTES) -> str:
     h = hashlib.sha1()
@@ -74,72 +110,191 @@ def file_sha1_head(p: Path, max_bytes: int = PARTIAL_HASH_BYTES) -> str:
             read += len(chunk)
     return h.hexdigest()
 
+def _to_str_values(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if x is not None]
+    if isinstance(v, (str, int, float)):
+        return [str(v)]
+    return [str(v)]
 
 def parse_date_string(s: str):
-    for fmt in ("%Y:%m:%d %H:%M:%S%z", "%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S"):
+    if not s:
+        return None
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    formats = (
+        "%Y:%m:%d %H:%M:%S%z",
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S.%f%z",
+        "%Y:%m:%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S.%f%z",
+        "%Y-%m-%d %H:%M:%S.%f",
+    )
+    for fmt in formats:
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
     return None
 
+def _normalize_to_local(dt: datetime) -> datetime:
+    if not NORMALIZE_TO_LOCAL:
+        return dt
+    try:
+        if dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None:
+            return dt.astimezone(datetime.now().astimezone().tzinfo)
+    except Exception:
+        pass
+    return dt
+
+# ----------------------------
+# Esecuzione robusta di exiftool (fix WinError 5)
+# ----------------------------
+def _run_cmd_robust(cmd_list: List[str]) -> subprocess.CompletedProcess:
+    """
+    Prova prima senza shell. Se PermissionError/WinError 5, riprova con shell=True
+    (cmd.exe) costruendo una riga di comando quotata.
+    """
+    try:
+        return subprocess.run(cmd_list, capture_output=True, text=True)
+    except PermissionError as e:
+        winerr = getattr(e, "winerror", None)
+        if os.name == "nt" and winerr == 5:
+            # Fallback via cmd.exe
+            quoted = []
+            for tok in cmd_list:
+                if " " in tok or "\\" in tok or ":" in tok:
+                    quoted.append(f'"{tok}"')
+                else:
+                    quoted.append(tok)
+            cmdline = " ".join(quoted)
+            return subprocess.run(cmdline, capture_output=True, text=True, shell=True)
+        raise
+    except OSError as e:
+        winerr = getattr(e, "winerror", None)
+        if os.name == "nt" and winerr == 5:
+            quoted = []
+            for tok in cmd_list:
+                if " " in tok or "\\" in tok or ":" in tok:
+                    quoted.append(f'"{tok}"')
+                else:
+                    quoted.append(tok)
+            cmdline = " ".join(quoted)
+            return subprocess.run(cmdline, capture_output=True, text=True, shell=True)
+        raise
+
+def exiftool_version(exiftool: str) -> str | None:
+    try:
+        r = _run_cmd_robust([exiftool, "-ver"])
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+# ----------------------------
+# Exiftool wrapper (con formato date forzato)
+# ----------------------------
+def run_exiftool_json(exiftool: str, tags: List[str], files: List[Path]) -> List[dict] | None:
+    abs_files = [str(p.resolve()) for p in files]
+    fmt = ["-d", "%Y:%m:%d %H:%M:%S%z"]
+
+    attempts = [
+        [exiftool, "-q", "-q", "-fast", "-j", "-charset", "filename=utf8", "-api", "QuickTimeUTC",
+         *fmt, *[f"-{k}" for k in tags], *abs_files],
+        [exiftool, "-q", "-q", "-j", "-charset", "filename=utf8",
+         *fmt, *[f"-{k}" for k in tags], *abs_files],
+    ]
+    for i, cmd in enumerate(attempts, start=1):
+        try:
+            r = _run_cmd_robust(cmd)
+            if r.returncode == 0 and r.stdout.strip():
+                try:
+                    return json.loads(r.stdout)
+                except Exception as je:
+                    print(f"[ERRORE] JSON parse exiftool (tentativo {i}): {je}")
+            else:
+                err = (r.stderr or "").strip()
+                print(f"[ERRORE] exiftool rc={r.returncode} (tentativo {i}) su {len(files)} file. stderr: {err}")
+        except Exception as e:
+            msg = str(e)
+            if os.name == "nt" and ("WinError 5" in msg or "Accesso negato" in msg):
+                print("❌ ERRORE: Windows ha negato l'esecuzione di exiftool.exe (WinError 5).")
+                print("   Suggerimenti: Sblocca il file, verifica i permessi NTFS della cartella,")
+                print("   o consenti l'app in 'Accesso alle cartelle controllato' di Windows Defender.")
+            else:
+                print(f"[ERRORE] eseguendo exiftool (tentativo {i}): {e}")
+    return None
 
 def exif_dates_batch(exiftool: str, files: List[Path]) -> Dict[Path, datetime]:
     result: Dict[Path, datetime] = {}
     if not files or not exiftool:
         return result
-    base_cmd = [
-        exiftool, "-q", "-q", "-fast",
-        "-j", "-api", "QuickTimeUTC",
-        "-DateTimeOriginal", "-CreateDate", "-MediaCreateDate", "-TrackCreateDate", "-ModifyDate",
-    ]
     for i in range(0, len(files), BATCH_EXIF_SIZE):
         chunk = files[i:i + BATCH_EXIF_SIZE]
-        cmd = base_cmd + [str(p) for p in chunk]
-        try:
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-            arr = json.loads(out.decode("utf-8", errors="ignore"))
-            for obj in arr:
-                src = obj.get("SourceFile")
-                if not src:
-                    continue
-                path = Path(src)
-                dt = None
-                for k in DATE_KEYS:
-                    v = obj.get(k)
-                    if isinstance(v, str):
-                        dt = parse_date_string(v)
-                        if dt:
-                            break
-                if dt:
-                    result[path] = dt
-        except Exception:
+        arr = run_exiftool_json(exiftool, DATE_KEYS, chunk)
+        if not arr:
+            for p in chunk:
+                if WARN_ON_MTIME:
+                    print(f"[WARN] Nessuna data metadata parsabile (batch) per: {p.name}. Userò mtime al bisogno.")
             continue
+        for obj in arr:
+            src = obj.get("SourceFile")
+            if not src:
+                continue
+            path = Path(src)
+            chosen = None
+            chosen_key = None
+            for k in DATE_KEYS:
+                vals = _to_str_values(obj.get(k))
+                for sv in vals:
+                    dt = parse_date_string(sv)
+                    if dt:
+                        chosen = _normalize_to_local(dt)
+                        chosen_key = k
+                        break
+                if chosen:
+                    break
+            if chosen:
+                result[path] = chosen
+                if LOG_PICKED_DATE:
+                    print(f"[DATE] {path.name}: {chosen.isoformat()} (tag={chosen_key})")
+            else:
+                if WARN_ON_MTIME:
+                    print(f"[WARN] Nessuna data metadata parsabile (batch) per: {path.name}. Userò mtime al bisogno.")
     return result
-
 
 def get_taken_datetime(p: Path, exiftool: str | None, premap: Dict[Path, datetime] | None = None) -> datetime:
     if premap and p in premap:
         return premap[p]
     if exiftool:
-        try:
-            out = subprocess.check_output([
-                exiftool, "-q", "-q", "-fast", "-j", "-api", "QuickTimeUTC",
-                "-DateTimeOriginal", "-CreateDate", "-MediaCreateDate", "-TrackCreateDate", "-ModifyDate",
-                str(p)
-            ], stderr=subprocess.DEVNULL)
-            obj = json.loads(out.decode("utf-8", errors="ignore"))[0]
+        arr = run_exiftool_json(exiftool, DATE_KEYS, [p])
+        if arr and isinstance(arr, list) and arr:
+            obj = arr[0]
             for k in DATE_KEYS:
-                v = obj.get(k)
-                if isinstance(v, str):
-                    dt = parse_date_string(v)
+                vals = _to_str_values(obj.get(k))
+                for sv in vals:
+                    dt = parse_date_string(sv)
                     if dt:
+                        dt = _normalize_to_local(dt)
+                        if LOG_PICKED_DATE:
+                            print(f"[DATE] {p.name}: {dt.isoformat()} (tag={k})")
                         return dt
-        except Exception:
-            pass
+            if WARN_ON_MTIME:
+                print(f"[WARN] Nessuna data metadata parsabile per: {p.name}. Uso mtime.")
+        else:
+            if WARN_ON_MTIME:
+                print(f"[WARN] exiftool non ha restituito dati per {p.name}. Uso mtime.")
     return datetime.fromtimestamp(p.stat().st_mtime)
 
-
+# ----------------------------
+# Duplicati e organizzazione
+# ----------------------------
 def sidecars_for(p: Path, base_dir: Path) -> Iterable[Path]:
     stem = p.with_suffix("").name
     for ext in SIDECAR_EXT:
@@ -150,18 +305,15 @@ def sidecars_for(p: Path, base_dir: Path) -> Iterable[Path]:
         except Exception:
             continue
 
-
 def ensure_dir(p: Path, dry_run: bool):
     if not dry_run:
         p.mkdir(parents=True, exist_ok=True)
-
 
 def append_report_line(base: Path, src: Path, dst: Path, dry_run: bool):
     line = f"DUPLICATO: '{src.name}' uguale a '{dst.name}' in {dst.parent}\n"
     if not dry_run:
         with (base / REPORT_FILE).open("a", encoding="utf-8") as f:
             f.write(line)
-
 
 def human_size(n: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -171,7 +323,6 @@ def human_size(n: int) -> str:
         f /= 1024.0
         i += 1
     return f"{f:.2f} {units[i]}"
-
 
 def walk_files(base: Path, recursive: bool) -> Iterable[Path]:
     if not recursive:
@@ -199,7 +350,6 @@ def walk_files(base: Path, recursive: bool) -> Iterable[Path]:
                             continue
             except Exception:
                 continue
-
 
 def find_duplicate_groups(base: Path, recursive: bool):
     size_map: Dict[int, List[Path]] = defaultdict(list)
@@ -241,55 +391,6 @@ def find_duplicate_groups(base: Path, recursive: bool):
     dup_groups = {h: lst for h, lst in full_groups.items() if len(lst) > 1}
     return dup_groups, total_files, total_bytes
 
-
-def find_duplicate_groups_between(dir1: Path, dir2: Path, recursive: bool):
-    size_map: Dict[int, List[Path]] = defaultdict(list)
-    total_files = 0
-    total_bytes = 0
-    for base in (dir1, dir2):
-        for p in walk_files(base, recursive):
-            try:
-                st = p.stat()
-            except Exception:
-                continue
-            size_map[st.st_size].append(p)
-            total_files += 1
-            total_bytes += st.st_size
-            if total_files % 1000 == 0:
-                print(f"  … indicizzati {total_files} file")
-
-    partial_groups: Dict[Tuple[int, str], List[Path]] = defaultdict(list)
-    for size, group in size_map.items():
-        if len(group) < 2:
-            continue
-        for p in group:
-            try:
-                ph = file_sha1_head(p, PARTIAL_HASH_BYTES)
-            except Exception:
-                continue
-            partial_groups[(size, ph)].append(p)
-
-    full_groups: Dict[str, List[Path]] = defaultdict(list)
-    for (size, ph), group in partial_groups.items():
-        if len(group) < 2:
-            continue
-        for p in group:
-            try:
-                h = file_sha1(p)
-            except Exception:
-                continue
-            full_groups[h].append(p)
-
-    dup_groups = {h: lst for h, lst in full_groups.items() if len(lst) > 1}
-    filtered: Dict[str, List[Path]] = {}
-    for h, paths in dup_groups.items():
-        in1 = any(p.is_relative_to(dir1) for p in paths)
-        in2 = any(p.is_relative_to(dir2) for p in paths)
-        if in1 and in2:
-            filtered[h] = paths
-    return filtered, total_files, total_bytes
-
-
 def scan_duplicates(base: Path, recursive: bool):
     print(f"Inizio scansione duplicati in: {base}  (ricorsivo: {'Sì' if recursive else 'No'})")
     dup_groups, total_files, total_bytes = find_duplicate_groups(base, recursive)
@@ -317,60 +418,14 @@ def scan_duplicates(base: Path, recursive: bool):
     print(f"Report scritto in: {base / DUP_SCAN_REPORT}")
     return dup_groups
 
-
-def scan_duplicates_between(dir1: Path, dir2: Path, recursive: bool):
-    print(
-        f"Inizio scansione duplicati tra: {dir1} e {dir2}  (ricorsivo: {'Sì' if recursive else 'No'})"
-    )
-    dup_groups, total_files, total_bytes = find_duplicate_groups_between(dir1, dir2, recursive)
-    groups_count = len(dup_groups)
-    potential_savings = 0
-
-    with (dir1 / DUP_SCAN_REPORT).open("w", encoding="utf-8") as f:
-        f.write(
-            f"Report duplicati tra due cartelle — generato: {datetime.now().isoformat()}\n"
-        )
-        f.write(f"Cartella A: {dir1}\nCartella B: {dir2}\n")
-        f.write(f"Ricorsivo: {'Sì' if recursive else 'No'}\n")
-        f.write(
-            f"File indicizzati: {total_files}  (totale dati: {human_size(total_bytes)})\n\n"
-        )
-        for i, (h, paths) in enumerate(
-            sorted(dup_groups.items(), key=lambda x: -len(x[1])), start=1
-        ):
-            try:
-                sz = paths[0].stat().st_size
-            except Exception:
-                sz = 0
-            save = sz * (len(paths) - 1)
-            potential_savings += save
-            f.write(
-                f"[{i}] SHA1={h}  pezzi={len(paths)}  size={human_size(sz)}  risparmio_potenziale={human_size(save)}\n"
-            )
-            for p in paths:
-                f.write(f"    - {p}\n")
-            f.write("\n")
-        f.write(
-            f"=== RIEPILOGO ===\nGruppi duplicati: {groups_count}\nPotenziale spazio recuperabile: {human_size(potential_savings)}\n"
-        )
-
-    print(
-        f"Scansione completata. Gruppi duplicati tra cartelle: {groups_count}."
-    )
-    print(f"Report scritto in: {dir1 / DUP_SCAN_REPORT}")
-    return dup_groups
-
-
 def choose_keeper(paths: List[Path]) -> Path:
     try:
         return min(paths, key=lambda p: p.stat().st_mtime)  # tieni il più vecchio per mtime
     except Exception:
         return min(paths, key=lambda p: str(p))
 
-
 def consolidate_duplicates(base: Path, dup_groups: Dict[str, List[Path]], mode: str = "quarantine"):
-    """mode: 'quarantine' = sposta copie in cartella, 'delete' = elimina definitivamente le copie."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S$")
     quarantine_root = base / f"_QuarantenaDuplicati_{timestamp}"
     if mode == "quarantine":
         quarantine_root.mkdir(parents=True, exist_ok=True)
@@ -418,7 +473,6 @@ def consolidate_duplicates(base: Path, dup_groups: Dict[str, List[Path]], mode: 
     else:
         print("Operazione completata: COPIE duplicate eliminate definitivamente.")
 
-
 def iter_candidates_fast(folder: Path):
     with os.scandir(folder) as it:
         for entry in it:
@@ -434,46 +488,35 @@ def iter_candidates_fast(folder: Path):
                 continue
             yield (mtime, Path(folder / name))
 
-
+# ----------------------------
+# main
+# ----------------------------
 def main():
     base = Path(__file__).resolve().parent
-    exiftool = detect_exiftool(base)
+    exiftool = get_exiftool_path(base)
+
+    print(f"Cartella di lavoro: {base}")
+    if exiftool:
+        ver = exiftool_version(exiftool) or "sconosciuta"
+        print(f"exiftool: trovato -> {exiftool} (ver: {ver})")
+    else:
+        print("exiftool: NON trovato, userò mtime come fallback")
 
     # Prompt: scansione / risoluzione duplicati
-    dup = input(
-        "Vuoi eseguire una SCANSIONE DUPLICATI senza spostare nulla? [s/N]: "
-    ).strip().lower()
+    dup = input("Vuoi eseguire una SCANSIONE DUPLICATI senza spostare nulla? [s/N]: ").strip().lower()
     if dup == "s":
-        dir1_in = input(
-            "Prima cartella sorgente [Invio = cartella script]: "
-        ).strip()
-        dir2_in = input(
-            "Seconda cartella per confronto (Invio = nessuna): "
-        ).strip()
         rec = input("Includere anche le SOTTOCARTELLE (ricorsivo)? [S/n]: ").strip().lower()
         recursive = (rec != "n")
-        dir1 = Path(dir1_in).resolve() if dir1_in else base
-        if dir2_in:
-            dir2 = Path(dir2_in).resolve()
-            scan_duplicates_between(dir1, dir2, recursive)
-            print("\nFINE scansione duplicati tra cartelle. Esco.")
-            return
-        dup_groups = scan_duplicates(dir1, recursive)
+        dup_groups, _, _ = find_duplicate_groups(base, recursive)
         if dup_groups:
-            fix = input(
-                "Vuoi RISOLVERE i duplicati adesso lasciandone uno solo? [s/N]: "
-            ).strip().lower()
+            _ = scan_duplicates(base, recursive)
+            fix = input("Vuoi RISOLVERE i duplicati adesso lasciandone uno solo? [s/N]: ").strip().lower()
             if fix == "s":
-                mode = input(
-                    "Come procedo? [1 = sposta in QUARANTENA (consigliato), 2 = ELIMINA definitivamente]: "
-                ).strip()
+                mode = input("Come procedo? [1 = sposta in QUARANTENA (consigliato), 2 = ELIMINA definitivamente]: ").strip()
                 mode = "delete" if mode == "2" else "quarantine"
-                print(
-                    "ATTENZIONE: l'operazione è potenzialmente distruttiva. Continua? [s/N]: ",
-                    end="",
-                )
+                print("ATTENZIONE: l'operazione è potenzialmente distruttiva. Continua? [s/N]: ", end="")
                 if input().strip().lower() == "s":
-                    consolidate_duplicates(dir1, dup_groups, mode=mode)
+                    consolidate_duplicates(base, dup_groups, mode=mode)
                 else:
                     print("Annullato su richiesta utente.")
         else:
@@ -494,8 +537,6 @@ def main():
             print("Valore batch non valido: ignoro, nessun limite.")
             batch_size = None
 
-    print(f"Cartella di lavoro: {base}")
-    print("exiftool:", f"trovato -> {exiftool}" if exiftool else "NON trovato, userò mtime come fallback")
     print("Modalità:", "DRY-RUN (simulazione, non sposto nulla)" if dry_run else "NORMALE (sposto i file)")
 
     # Prescan ottimizzato
