@@ -164,5 +164,3 @@ python organize_photos_v5.py --utc --prehash-bytes 16777216
 * `-api QuickTimeUTC` **disattivo di default** (usalo solo se ti serve esplicitamente con `--qt-utc`).
 
 ---
-
-**Buon lavoro!** Se vuoi, posso personalizzare questa guida per il tuo ambiente (Windows/NAS, SSD/HDD, dimensione media dei file) con esempi *taylor-made*.
